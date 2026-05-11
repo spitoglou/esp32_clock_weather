@@ -102,12 +102,45 @@ unsigned long lastScanStartedAt    = 0;
 const unsigned long SCAN_CACHE_MS  = 30000;
 
 struct WeatherData {
+  // current
   bool  valid       = false;
   float temperature = 0;
   int   humidity    = 0;
   float windSpeed   = 0;
   int   code        = -1;
+
+  // daily — index 0 = today, 1 = tomorrow, 2 = day after
+  bool  dailyValid   = false;
+  float dailyMax[3]  = {0, 0, 0};
+  float dailyMin[3]  = {0, 0, 0};
+  int   dailyCode[3] = {-1, -1, -1};
+  char  todaySunrise[6] = {0};   // "HH:MM"
+  char  todaySunset[6]  = {0};
+
+  // hourly precipitation probability — 12 entries starting at hourlyStartHour
+  bool    hourlyValid       = false;
+  uint8_t precipProb[12]    = {0};
+  int     hourlyStartHour   = 0;
 } weather;
+
+// ---------- OLED page rotation ----------
+enum Page {
+  PAGE_MAIN = 0,
+  PAGE_FORECAST,
+  PAGE_PRECIP,
+  PAGE_SUN,
+  PAGE_SYSTEM,
+  PAGE_COUNT
+};
+static const unsigned long PAGE_DURATIONS_MS[PAGE_COUNT] = {
+  10000UL,   // MAIN
+   6000UL,   // FORECAST
+   6000UL,   // PRECIP
+   6000UL,   // SUN
+   6000UL,   // SYSTEM
+};
+static Page          currentPage   = PAGE_MAIN;
+static unsigned long pageEnteredAt = 0;
 
 void runConfigPortal();   // forward decl
 
@@ -532,18 +565,73 @@ const char* weatherDescription(int code) {
   }
 }
 
+// Short form (<=7 chars) used by the 3-day forecast page
+const char* weatherDescriptionShort(int code) {
+  switch (code) {
+    case 0: case 1:             return "Clear";
+    case 2:                     return "PtCloud";
+    case 3:                     return "Cloudy";
+    case 45: case 48:           return "Fog";
+    case 51: case 53: case 55:  return "Drizzle";
+    case 56: case 57:           return "FzDrzl";
+    case 61:                    return "LtRain";
+    case 63:                    return "Rain";
+    case 65:                    return "HvRain";
+    case 66: case 67:           return "FzRain";
+    case 71:                    return "LtSnow";
+    case 73:                    return "Snow";
+    case 75:                    return "HvSnow";
+    case 77:                    return "Grains";
+    case 80: case 81:           return "Showers";
+    case 82:                    return "HvShwrs";
+    case 85: case 86:           return "SnShwrs";
+    case 95:                    return "Storm";
+    case 96: case 99:           return "Storm+";
+    default:                    return "?";
+  }
+}
+
+// Copies "HH:MM" out of an Open-Meteo "YYYY-MM-DDTHH:MM" timestamp.
+// `out` must hold at least 6 bytes.
+static void extractTimeOfDay(const char* iso, char* out) {
+  if (!iso || strlen(iso) < 16) { out[0] = 0; return; }
+  memcpy(out, iso + 11, 5);
+  out[5] = 0;
+}
+
+// "06:14" + "20:39" -> "14h 25m" (wraps over midnight if needed).
+static void formatDayLength(const char* sunrise, const char* sunset,
+                            char* out, size_t outSize) {
+  if (strlen(sunrise) < 5 || strlen(sunset) < 5) {
+    snprintf(out, outSize, "--");
+    return;
+  }
+  int srM = (sunrise[0]-'0')*600 + (sunrise[1]-'0')*60
+          + (sunrise[3]-'0')*10  + (sunrise[4]-'0');
+  int ssM = (sunset[0]-'0')*600  + (sunset[1]-'0')*60
+          + (sunset[3]-'0')*10   + (sunset[4]-'0');
+  int diff = ssM - srM;
+  if (diff < 0) diff += 24 * 60;
+  snprintf(out, outSize, "%dh %02dm", diff / 60, diff % 60);
+}
+
 bool fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(7);   // seconds — caps the TLS handshake
+  client.setTimeout(10);   // seconds — caps the TLS handshake
   HTTPClient http;
-  http.setTimeout(7000);
+  http.setTimeout(10000);
 
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=")
              + String(LATITUDE, 4) + "&longitude=" + String(LONGITUDE, 4)
-             + "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m";
+             + "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+             + "&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,weather_code"
+             + "&hourly=precipitation_probability"
+             + "&forecast_days=3"
+             + "&forecast_hours=12"
+             + "&timezone=auto";
 
   if (!http.begin(client, url)) {
     Serial.println(F("Weather: http.begin failed"));
@@ -575,9 +663,64 @@ bool fetchWeather() {
   weather.code        = current["weather_code"]        | -1;
   weather.valid       = true;
 
+  // Daily (next 3 days)
+  JsonObject daily = doc["daily"];
+  JsonArray dMax  = daily["temperature_2m_max"];
+  JsonArray dMin  = daily["temperature_2m_min"];
+  JsonArray dCode = daily["weather_code"];
+  JsonArray dSr   = daily["sunrise"];
+  JsonArray dSs   = daily["sunset"];
+  if (!dMax.isNull() && !dMin.isNull() && !dCode.isNull() && dMax.size() >= 3) {
+    for (int i = 0; i < 3; i++) {
+      weather.dailyMax[i]  = dMax[i]  | 0.0f;
+      weather.dailyMin[i]  = dMin[i]  | 0.0f;
+      weather.dailyCode[i] = dCode[i] | -1;
+    }
+    if (!dSr.isNull() && dSr.size() > 0) {
+      extractTimeOfDay(dSr[0] | "", weather.todaySunrise);
+      extractTimeOfDay(dSs[0] | "", weather.todaySunset);
+    }
+    weather.dailyValid = true;
+  }
+
+  // Hourly precipitation probability — find entry matching "now" hour, then
+  // copy the next 12 values. With forecast_hours=12 the array is already
+  // aligned, but this lookup also handles longer arrays defensively.
+  JsonObject hourly = doc["hourly"];
+  JsonArray  hTime  = hourly["time"];
+  JsonArray  hProb  = hourly["precipitation_probability"];
+  if (!hTime.isNull() && !hProb.isNull() && hProb.size() > 0) {
+    int startIdx = 0;
+    struct tm tNow = {};
+    if (getLocalTime(&tNow, 100)) {
+      char target[14];
+      strftime(target, sizeof(target), "%Y-%m-%dT%H", &tNow);
+      for (size_t i = 0; i < hTime.size(); i++) {
+        const char* tStr = hTime[i] | "";
+        if (strncmp(tStr, target, 13) == 0) { startIdx = (int)i; break; }
+      }
+    }
+    int available = (int)hProb.size() - startIdx;
+    int n = available < 12 ? available : 12;
+    for (int i = 0; i < 12; i++) {
+      weather.precipProb[i] = (i < n) ? (uint8_t)(hProb[startIdx + i] | 0) : 0;
+    }
+    const char* t0 = hTime[startIdx] | "";
+    if (strlen(t0) >= 13) {
+      weather.hourlyStartHour = (t0[11]-'0')*10 + (t0[12]-'0');
+    }
+    weather.hourlyValid = true;
+  }
+
   Serial.printf("Weather: %.1f°C, %s, %d%% RH, %.1f km/h\n",
                 weather.temperature, weatherDescription(weather.code),
                 weather.humidity, weather.windSpeed);
+  if (weather.dailyValid) {
+    Serial.printf("Daily: today %.0f/%.0f, tomorrow %.0f/%.0f, sunrise %s sunset %s\n",
+                  weather.dailyMax[0], weather.dailyMin[0],
+                  weather.dailyMax[1], weather.dailyMin[1],
+                  weather.todaySunrise, weather.todaySunset);
+  }
   return true;
 }
 
@@ -686,6 +829,178 @@ void renderOLED(bool haveTime, const struct tm& t) {
 }
 
 // ============================================================================
+//                       OLED — additional informational pages
+// ============================================================================
+void renderForecastPage(bool haveTime, const struct tm& t) {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+
+  oled.setCursor(0, 0);
+  oled.print(F("3-day forecast"));
+
+  if (!weather.dailyValid) {
+    oled.setCursor(0, 28);
+    oled.print(F("Loading..."));
+    oled.display();
+    return;
+  }
+
+  static const char* const DOWS[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  for (int i = 0; i < 3; i++) {
+    int y = 16 + i * 14;
+
+    oled.setCursor(0, y);
+    if (haveTime) oled.print(DOWS[(t.tm_wday + i) % 7]);
+    else          oled.print(F("---"));
+
+    char tempStr[12];
+    snprintf(tempStr, sizeof(tempStr), "%2d/%2d",
+             (int)round(weather.dailyMax[i]),
+             (int)round(weather.dailyMin[i]));
+    oled.setCursor(28, y);
+    oled.print(tempStr);
+
+    oled.setCursor(74, y);
+    oled.print(weatherDescriptionShort(weather.dailyCode[i]));
+  }
+
+  oled.display();
+}
+
+void renderPrecipPage() {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+
+  oled.setCursor(0, 0);
+  oled.print(F("Precip prob 12h"));
+
+  if (!weather.hourlyValid) {
+    oled.setCursor(0, 28);
+    oled.print(F("Loading..."));
+    oled.display();
+    return;
+  }
+
+  const int BAR_W      = 8;
+  const int BAR_PITCH  = 10;
+  const int BAR_LEFT   = 4;
+  const int BAR_BOTTOM = 54;
+  const int BAR_MAX_H  = 38;
+
+  for (int i = 0; i < 12; i++) {
+    int x    = BAR_LEFT + i * BAR_PITCH;
+    int prob = weather.precipProb[i];
+    int h    = (prob * BAR_MAX_H) / 100;
+    if (h < 1 && prob > 0) h = 1;
+    if (h > 0) oled.fillRect(x, BAR_BOTTOM - h, BAR_W, h, SSD1306_WHITE);
+    // 1px baseline tick so empty hours still show
+    oled.drawPixel(x + BAR_W / 2, BAR_BOTTOM, SSD1306_WHITE);
+  }
+
+  // Footer labels: start hour at left, "+12h" at right
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d:00", weather.hourlyStartHour);
+  oled.setCursor(0, 56);
+  oled.print(buf);
+  oled.setCursor(SCREEN_WIDTH - 4 * GFX_CHAR_W, 56);
+  oled.print(F("+12h"));
+
+  oled.display();
+}
+
+void renderSunPage() {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+
+  oled.setCursor(0, 0);
+  oled.print(F("Sun"));
+
+  if (!weather.dailyValid || weather.todaySunrise[0] == 0) {
+    oled.setCursor(0, 28);
+    oled.print(F("Loading..."));
+    oled.display();
+    return;
+  }
+
+  oled.setCursor(0, 20);
+  oled.print(F("Sunrise   "));
+  oled.print(weather.todaySunrise);
+
+  oled.setCursor(0, 34);
+  oled.print(F("Sunset    "));
+  oled.print(weather.todaySunset);
+
+  char dayLen[12];
+  formatDayLength(weather.todaySunrise, weather.todaySunset,
+                  dayLen, sizeof(dayLen));
+  oled.setCursor(0, 48);
+  oled.print(F("Day len   "));
+  oled.print(dayLen);
+
+  oled.display();
+}
+
+void renderSystemPage() {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+
+  oled.setCursor(0, 0);
+  oled.print(F("System"));
+
+  unsigned long s = millis() / 1000;
+  int days  = s / 86400; s %= 86400;
+  int hours = s / 3600;  s %= 3600;
+  int mins  = s / 60;
+  int secs  = s % 60;
+
+  char buf[24];
+
+  // Body rows start at y=16 so nothing straddles the yellow/blue boundary
+  // on bicolor SSD1306 panels (yellow band = rows 0..15).
+  oled.setCursor(0, 16);
+  oled.print(F("Up   "));
+  if (days > 0) snprintf(buf, sizeof(buf), "%dd %02d:%02d:%02d", days, hours, mins, secs);
+  else          snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hours, mins, secs);
+  oled.print(buf);
+
+  oled.setCursor(0, 26);
+  oled.print(F("IP   "));
+  if (WiFi.status() == WL_CONNECTED) oled.print(WiFi.localIP());
+  else                               oled.print(F("--"));
+
+  oled.setCursor(0, 36);
+  oled.print(F("RSSI "));
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buf, sizeof(buf), "%d dBm", WiFi.RSSI());
+    oled.print(buf);
+  } else {
+    oled.print(F("--"));
+  }
+
+  oled.setCursor(0, 46);
+  oled.print(F("Heap "));
+  snprintf(buf, sizeof(buf), "%u KB free", (unsigned)(ESP.getFreeHeap() / 1024));
+  oled.print(buf);
+
+  oled.setCursor(0, 56);
+  oled.print(F("SSID "));
+  oled.print(savedSsid);
+
+  oled.display();
+}
+
+void renderOLEDDispatch(bool haveTime, const struct tm& t) {
+  switch (currentPage) {
+    case PAGE_MAIN:     renderOLED(haveTime, t);         break;
+    case PAGE_FORECAST: renderForecastPage(haveTime, t); break;
+    case PAGE_PRECIP:   renderPrecipPage();              break;
+    case PAGE_SUN:      renderSunPage();                 break;
+    case PAGE_SYSTEM:   renderSystemPage();              break;
+    default: break;
+  }
+}
+
+// ============================================================================
 //                            ARDUINO ENTRY POINTS
 // ============================================================================
 void setup() {
@@ -722,6 +1037,7 @@ void setup() {
   lastConnectedAt      = now;
   lastWeatherAttempt   = now;
   weatherIntervalNow   = WEATHER_FIRST_DELAY_MS;
+  pageEnteredAt        = now;
 
   initTime();
 }
@@ -743,17 +1059,25 @@ void loop() {
     if (haveTime) renderSegment(true, t, colonOn);
   }
 
+  // Advance OLED page after its duration elapses
+  bool pageChanged = false;
+  if (now - pageEnteredAt >= PAGE_DURATIONS_MS[currentPage]) {
+    currentPage = (Page)((currentPage + 1) % PAGE_COUNT);
+    pageEnteredAt = now;
+    pageChanged = true;
+  }
+
   if (haveTime) {
-    if (t.tm_sec != lastSecondRendered) {
+    if (t.tm_sec != lastSecondRendered || pageChanged) {
       lastSecondRendered = t.tm_sec;
-      renderOLED(true, t);
+      renderOLEDDispatch(true, t);
     }
   } else {
-    if (now - lastNoTimeRender > 1000) {
+    if (now - lastNoTimeRender > 1000 || pageChanged) {
       lastNoTimeRender = now;
       struct tm dummy = {};
       renderSegment(false, dummy, false);
-      renderOLED(false, dummy);
+      renderOLEDDispatch(false, dummy);
     }
   }
 
