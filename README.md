@@ -1,8 +1,9 @@
 # ESP32 NTP Clock + Weather
 
 ESP32-WROOM-32 firmware that drives a **TM1637 4-digit 7-segment** display
-(HH:MM with a blinking colon) and a **128x64 SSD1306 OLED** (date, temperature,
-condition, wind, humidity, WiFi info). Time comes from NTP, weather from
+(HH:MM with a blinking colon) and a **128x64 SSD1306 OLED** that auto-rotates
+through five pages: current conditions, 3-day forecast, 12-hour precipitation
+chart, sunrise/sunset, and system status. Time comes from NTP, weather from
 [Open-Meteo](https://open-meteo.com) (free, no API key). WiFi credentials are
 provisioned via a captive-portal AP — no hard-coded SSIDs in the firmware.
 
@@ -13,6 +14,8 @@ provisioned via a captive-portal AP — no hard-coded SSIDs in the firmware.
 - HH:MM on 7-segment, colon blinks at exactly 1 Hz.
 - OLED layout split for dual-color (yellow/blue) panels: small text in the top
   yellow band, big temperature + status rows in the blue band.
+- OLED auto-rotates through 5 informational pages (main 10 s, then four
+  secondary pages 6 s each — 34 s full cycle).
 - Captive-portal WiFi config (first boot, on saved-cred failure, or after
   10 min offline mid-run).
 - Async network scan with 30 s cache so the captive page lands fast and
@@ -133,7 +136,22 @@ To re-enter the portal later: hold the BOOT button while powering on.
 - Colon blinks at 1 Hz (driven by [main.cpp:75](src/main.cpp#L75) `COLON_BLINK_MS`).
 - Shows dashes (`----`) before NTP has synced.
 
-**OLED** layout (top to bottom):
+**OLED** rotates through five pages. Durations live in
+`PAGE_DURATIONS_MS[]` near the top of [src/main.cpp](src/main.cpp); page
+advance lives in `loop()` and calls `renderOLEDDispatch()` for the active page.
+
+| #   | Page (constant)   | Duration | Content                                                                                              |
+| --- | ----------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| 1   | `PAGE_MAIN`       | 10 s     | Date + humidity (top), big temperature (middle), condition + wind (lower), IP + RSSI / retry (bottom) |
+| 2   | `PAGE_FORECAST`   | 6 s      | Three-day high/low temps and short condition text                                                    |
+| 3   | `PAGE_PRECIP`     | 6 s      | 12 vertical bars showing hourly precipitation probability for the next 12 h, start hour + `+12h` label |
+| 4   | `PAGE_SUN`        | 6 s      | Sunrise, sunset, and day length                                                                      |
+| 5   | `PAGE_SYSTEM`     | 6 s      | Uptime, IP, RSSI, free heap, saved SSID                                                              |
+
+Full rotation = 34 s. Page advance forces an immediate re-render so a page
+swap never leaves the previous page on-screen for up to a second.
+
+Page 1 layout (top to bottom):
 
 | Row range  | Content                                                          |
 | ---------- | ---------------------------------------------------------------- |
@@ -144,7 +162,7 @@ To re-enter the portal later: hold the BOOT button while powering on.
 
 The dual-color SSD1306 yellow band covers approximately rows 0–15. The big
 temperature deliberately starts at row 16 so it sits entirely in the blue
-section.
+section. Body rows on the other pages also start at y ≥ 16 for the same reason.
 
 ### State machine
 
@@ -247,10 +265,12 @@ Credentials live under namespace `clockcfg` with keys `ssid` and `pass`. See
 ### Project layout
 
 ```
-260509-150708-esp32dev/
+esp32_clock_weather/
   platformio.ini       PlatformIO project config + lib_deps
   src/main.cpp         entire firmware
   README.md            this file
+  IDEAS.md             curated future-feature backlog
+  CLAUDE.md            guidance for Claude Code sessions
   include/, lib/, test/ unused (PlatformIO defaults)
 ```
 
@@ -258,7 +278,7 @@ Credentials live under namespace `clockcfg` with keys `ssid` and `pass`. See
 
 | Section            | Anchors                                  | Responsibility                                  |
 | ------------------ | ---------------------------------------- | ----------------------------------------------- |
-| Headers + globals  | top of file                              | Constants, pin defs, state, weather struct      |
+| Headers + globals  | top of file                              | Constants, pin defs, state, weather struct, `Page` enum + `PAGE_DURATIONS_MS[]` |
 | Display init       | `initSegment` / `initOLED`               | TM1637 + I2C + SSD1306 startup                  |
 | Credentials        | `loadCredentials` / `saveCredentials` / `makeApSsid` | Preferences I/O, AP SSID derivation |
 | WiFi mgmt          | `connectSavedWiFi` / `manageWiFi`        | Boot connect + reconnect loop + offline trigger |
@@ -267,15 +287,18 @@ Credentials live under namespace `clockcfg` with keys `ssid` and `pass`. See
 | Portal scan        | `ensureScan`                             | Async + cached WiFi scan                        |
 | Portal loop        | `runConfigPortal`                        | AP + DNS + HTTP + clock keep-running            |
 | Time               | `initTime`                               | NTP servers + TZ                                |
-| Weather            | `weatherDescription` / `fetchWeather` / `manageWeather` | Open-Meteo client + cadence       |
-| OLED render        | `drawDegreeAndC` / `renderOLED`          | Main display layout                             |
-| Arduino entry      | `setup` / `loop`                         | Wiring it together                              |
+| Weather            | `weatherDescription` / `weatherDescriptionShort` / `extractTimeOfDay` / `formatDayLength` / `fetchWeather` / `manageWeather` | Open-Meteo client + cadence, text/time helpers |
+| OLED main page     | `drawDegreeAndC` / `renderOLED`          | `PAGE_MAIN` layout                              |
+| OLED other pages   | `renderForecastPage` / `renderPrecipPage` / `renderSunPage` / `renderSystemPage` / `renderOLEDDispatch` | Secondary pages + page-router dispatch |
+| Arduino entry      | `setup` / `loop`                         | Wiring it together, page advance                |
 
 ### Main loop pacing
 
 - `delay(20)` between iterations.
 - Colon flips every 500 ms; segment is redrawn on flip.
-- OLED redraws when `tm_sec` changes (effectively 1 Hz).
+- OLED page advances when its duration elapses (`PAGE_DURATIONS_MS[currentPage]`);
+  a forced re-render fires on transition so the swap is instant.
+- OLED redraws when `tm_sec` changes (effectively 1 Hz) or on page change.
 - WiFi reconnect attempt at most once every 30 s.
 - Weather refresh on its own schedule (15 min after success, 60 s after fail).
 
@@ -291,8 +314,11 @@ Credentials live under namespace `clockcfg` with keys `ssid` and `pass`. See
 
 - **NTP** — `pool.ntp.org`, `time.google.com` via `configTime`.
 - **Weather** — `https://api.open-meteo.com/v1/forecast`. Free tier, no API
-  key. Current params requested: `temperature_2m,relative_humidity_2m,
-  weather_code,wind_speed_10m`.
+  key. One HTTPS call per refresh bundles everything the five OLED pages need:
+  - `current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m`
+  - `daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,weather_code`
+  - `hourly=precipitation_probability`
+  - `forecast_days=3`, `forecast_hours=12`, `timezone=auto`
 - **TLS** — `client.setInsecure()`. The app does no auth and the data is
   unsensitive; pin a CA bundle if you want stricter integrity (see Extending).
 
@@ -379,8 +405,6 @@ A few directions if you want to keep playing:
   `loop`.
 - **MQTT / Home Assistant** — add `knolleary/PubSubClient` and publish
   `weather` + `WiFi.RSSI()` once per minute.
-- **Forecast / hourly view** — pass `&hourly=...` to Open-Meteo and rotate
-  display "pages" every N seconds.
 - **TLS root CA pinning** — replace `client.setInsecure()` with
   `client.setCACert(...)`. Open-Meteo uses Let's Encrypt ISRG Root X1.
 - **Settings UI** — extend the portal with a second page that edits TZ / lat /
